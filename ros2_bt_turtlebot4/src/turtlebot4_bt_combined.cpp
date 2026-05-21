@@ -3,6 +3,7 @@
 #include <string>
 #include <chrono>
 #include <cmath>
+#include <atomic>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/executors.hpp"
@@ -15,6 +16,31 @@
 #include "behaviortree_cpp_v3/loggers/bt_cout_logger.h"
 
 using namespace std::chrono_literals;
+
+// ============================================================================
+// SHARED UTILITIES
+// ============================================================================
+
+static double computeMinForwardDistance(
+    const sensor_msgs::msg::LaserScan& msg,
+    double forward_angle = -(M_PI / 2.0),
+    double angle_window = 20.0 * M_PI / 180.0)
+{
+    double min_dist = 999.0;
+    int num_ranges = msg.ranges.size();
+    for (int i = 0; i < num_ranges; ++i) {
+        double angle = msg.angle_min + i * msg.angle_increment;
+        if (std::abs(angle - forward_angle) <= angle_window) {
+            double range = msg.ranges[i];
+            if (std::isfinite(range) && range > msg.range_min && range < msg.range_max) {
+                if (range < min_dist) {
+                    min_dist = range;
+                }
+            }
+        }
+    }
+    return min_dist;
+}
 
 // ============================================================================
 // NODE DECLARATIONS
@@ -91,29 +117,13 @@ class ReadingLaserScanner : public BT::SyncActionNode
 public:
     ReadingLaserScanner(const std::string& name, const BT::NodeConfiguration& config,
                         rclcpp::Node::SharedPtr node)
-        : BT::SyncActionNode(name, config), node_(node), min_distance_(999.0), scan_received_(false)
+        : BT::SyncActionNode(name, config), node_(node)
     {
         scan_sub_ = node_->create_subscription<sensor_msgs::msg::LaserScan>(
             "/scan", 10,
             [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-                scan_received_ = true;
-                min_distance_ = 999.0;
-                
-                // Only consider ranges within ±20° of forward direction
-                double forward_angle = -(M_PI / 2.0); // Forward is +Y (red axis), -90 degrees from LIDAR 0
-                double angle_window = 20.0 * M_PI / 180.0; // 20 degrees in radians
-                int num_ranges = msg->ranges.size();
-                for (int i = 0; i < num_ranges; ++i) {
-                    double angle = msg->angle_min + i * msg->angle_increment;
-                    if (std::abs(angle - forward_angle) <= angle_window) {
-                        double range = msg->ranges[i];
-                        if (std::isfinite(range) && range > msg->range_min && range < msg->range_max) {
-                            if (range < min_distance_) {
-                                min_distance_ = range;
-                            }
-                        }
-                    }
-                }
+                min_distance_.store(computeMinForwardDistance(*msg));
+                scan_received_.store(true);
             });
     }
 
@@ -124,13 +134,14 @@ public:
 
     BT::NodeStatus tick() override
     {
-        if (!scan_received_) {
+        if (!scan_received_.load()) {
             RCLCPP_WARN(node_->get_logger(), "Waiting for laser scan data...");
             return BT::NodeStatus::FAILURE;
         }
         
-        RCLCPP_INFO(node_->get_logger(), "Laser scanner: minimum distance = %.2f m", min_distance_);
-        setOutput("min_distance", min_distance_);
+        double dist = min_distance_.load();
+        RCLCPP_INFO(node_->get_logger(), "Laser scanner: minimum distance = %.2f m", dist);
+        setOutput("min_distance", dist);
         
         return BT::NodeStatus::SUCCESS;
     }
@@ -138,8 +149,8 @@ public:
 private:
     rclcpp::Node::SharedPtr node_;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-    double min_distance_;
-    bool scan_received_;
+    std::atomic<double> min_distance_{999.0};
+    std::atomic<bool> scan_received_{false};
 };
 
 // MoveRobot - Moves robot forward for one tick (SyncActionNode)
@@ -171,65 +182,6 @@ private:
     rclcpp::Node::SharedPtr node_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_pub_;
     double linear_speed_;
-};
-
-// ConditionalLaserScanner - Only succeeds if min_distance > 1m
-class ConditionalLaserScanner : public BT::SyncActionNode
-{
-public:
-    ConditionalLaserScanner(const std::string& name, const BT::NodeConfiguration& config,
-                            rclcpp::Node::SharedPtr node)
-        : BT::SyncActionNode(name, config), node_(node), min_distance_(999.0), scan_received_(false), rotation_angle_(0)
-    {
-        scan_sub_ = node_->create_subscription<sensor_msgs::msg::LaserScan>(
-            "/scan", 10,
-            [this](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-                scan_received_ = true;
-                min_distance_ = 999.0;
-                for (const auto& range : msg->ranges) {
-                    if (std::isfinite(range) && range > msg->range_min && range < msg->range_max) {
-                        if (range < min_distance_) {
-                            min_distance_ = range;
-                        }
-                    }
-                }
-            });
-    }
-
-    static BT::PortsList providedPorts()
-    {
-        return {
-            BT::InputPort<int>("rotation", "Current rotation angle in degrees"),
-            BT::OutputPort<double>("min_distance", "Minimum distance detected")
-        };
-    }
-
-    BT::NodeStatus tick() override
-    {
-        if (!scan_received_) {
-            RCLCPP_WARN(node_->get_logger(), "Waiting for laser scan data...");
-            return BT::NodeStatus::FAILURE;
-        }
-        if (!getInput("rotation", rotation_angle_)) {
-            RCLCPP_WARN(node_->get_logger(), "No rotation angle provided to ConditionalLaserScanner");
-            return BT::NodeStatus::FAILURE;
-        }
-        setOutput("min_distance", min_distance_);
-        RCLCPP_INFO(node_->get_logger(), "ConditionalLaserScanner: rotation = %d deg, min_distance = %.2f m", rotation_angle_, min_distance_);
-        if (min_distance_ > 1.0) {
-            return BT::NodeStatus::SUCCESS;
-        }
-        return BT::NodeStatus::FAILURE;
-    }
-
-private:
-    rclcpp::Node::SharedPtr node_;
-    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
-    double min_distance_;
-    bool scan_received_;
-
-    int rotation_angle_;
-
 };
 
 // IsObstacleFar - Condition node: succeeds if min_distance > 1.0
@@ -290,11 +242,6 @@ int main(int argc, char** argv)
     };
     factory.registerBuilder<ReadingLaserScanner>("ReadingLaserScanner", scanner_builder);
 
-    BT::NodeBuilder conditional_scanner_builder = [node](const std::string& name, const BT::NodeConfiguration& config) {
-        return std::make_unique<ConditionalLaserScanner>(name, config, node);
-    };
-    factory.registerBuilder<ConditionalLaserScanner>("ConditionalLaserScanner", conditional_scanner_builder);
-
     BT::NodeBuilder move_builder = [node](const std::string& name, const BT::NodeConfiguration& config) {
         return std::make_unique<MoveRobot>(name, config, node);
     };
@@ -336,7 +283,7 @@ int main(int argc, char** argv)
     BT::StdCoutLogger logger_cout(tree);
     
     // Create executor for ROS2 spinning
-    rclcpp::executors::SingleThreadedExecutor executor;
+    rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     
     // Run the behavior tree
